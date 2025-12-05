@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
+Benchmark script with NVTX annotations for Nsight Systems profiling.
+
 Example usage:
-    uv run benchmark.py --num_layers 12 --d_model 768 --num_heads 12 --d_ff 3072 --batch_size 4 --seq_len 512
+    uv run nsys profile -o result --capture-range=cudaProfilerApi python benchmark_nvtx.py \
+        --num_layers 12 --d_model 768 --num_heads 12 --d_ff 3072 --batch_size 4 --seq_len 512
 """
 
 import argparse
 import torch
+import torch.cuda.nvtx as nvtx
 import numpy as np
 from timeit import default_timer as timer
 
@@ -13,20 +17,25 @@ from cs336_basics.TransformerLM.transformer_lm import TransformerLM
 from cs336_basics.Cross_entropy_loss_AdamW.cross_entropy import run_cross_entropy
 
 
-def generate_random_batch( batch_size: int, seq_len: int, vocab_size: int = 10000, device: str = 'cuda') -> tuple[torch.Tensor, torch.Tensor]:
+def generate_random_batch(batch_size: int, seq_len: int, vocab_size: int = 10000, device: str = 'cuda') -> tuple[torch.Tensor, torch.Tensor]:
     x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     y = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
     return x, y
 
 
-def benchmark_step( model: TransformerLM, x: torch.Tensor, y: torch.Tensor, forward_only: bool = False) -> None:
-    forward = model(x)
+def benchmark_step(model: TransformerLM, x: torch.Tensor, y: torch.Tensor, forward_only: bool = False) -> None:
+    with nvtx.range("forward_pass"):
+        forward = model(x)
     
     if not forward_only:
-        loss = run_cross_entropy(forward, y)
-        loss.backward()
+        with nvtx.range("loss_computation"):
+            loss = run_cross_entropy(forward, y)
         
-        model.zero_grad()
+        with nvtx.range("backward_pass"):
+            loss.backward()
+        
+        with nvtx.range("zero_grad"):
+            model.zero_grad()
 
 
 def run_benchmark(
@@ -41,34 +50,44 @@ def run_benchmark(
     if device is None:
         device = x.device
     
-    print(f"Running {warmup_steps} warm-up steps...")
+    # Warm-up phase (wrapped in NVTX range for easy filtering)
+    with nvtx.range("warmup_phase"):
+        print(f"Running {warmup_steps} warm-up steps...")
+        for i in range(warmup_steps):
+            with nvtx.range(f"warmup_step_{i}"):
+                benchmark_step(model, x, y, forward_only)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+            print(f"  Warm-up {i+1}/{warmup_steps} complete")
     
-    for i in range(warmup_steps):
-        benchmark_step(model, x, y, forward_only)
-        if device.type == 'cuda':
-            torch.cuda.synchronize(device)
-        print(f"  Warm-up {i+1}/{warmup_steps} complete")
+    # Start CUDA profiler after warm-up (for --capture-range=cudaProfilerApi)
+    torch.cuda.cudart().cudaProfilerStart()
     
     print(f"\nRunning {iter_steps} iteration steps...")
     
     # Iteration phase
     times = []
-    for i in range(iter_steps):
-        if device.type == 'cuda':
-            torch.cuda.synchronize(device)
-        
-        start = timer()
-        
-        benchmark_step(model, x, y, forward_only)
-        
-        if device.type == 'cuda':
-            torch.cuda.synchronize(device)
-        
-        end = timer()
-        
-        elapsed = end - start
-        times.append(elapsed)
-        print(f"  Step {i+1}/{iter_steps}: {elapsed*1000:.2f} ms")
+    with nvtx.range("benchmark_phase"):
+        for i in range(iter_steps):
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            
+            start = timer()
+            
+            with nvtx.range(f"iteration_step_{i}"):
+                benchmark_step(model, x, y, forward_only)
+            
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            
+            end = timer()
+            
+            elapsed = end - start
+            times.append(elapsed)
+            print(f"  Step {i+1}/{iter_steps}: {elapsed*1000:.2f} ms")
+    
+    # Stop CUDA profiler
+    torch.cuda.cudart().cudaProfilerStop()
     
     mean_time = np.mean(times)
     std_time = np.std(times)
@@ -78,7 +97,7 @@ def run_benchmark(
 
 def get_parser():
     parser = argparse.ArgumentParser(
-        description='Benchmark Transformer model',
+        description='Benchmark Transformer model with NVTX annotations',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
@@ -102,6 +121,7 @@ def get_parser():
 
     return parser
 
+
 def main():
     parser = get_parser()
     args = parser.parse_args()
@@ -118,11 +138,10 @@ def main():
         'bfloat16': torch.bfloat16
     }
     dtype = dtype_map[args.dtype]
-    
     d_ff = args.d_ff
     
     print("="*80)
-    print("TRANSFORMER BENCHMARKING")
+    print("TRANSFORMER BENCHMARKING (WITH NVTX ANNOTATIONS)")
     print("="*80)
 
     print("\nBenchmark Configuration:")
@@ -133,146 +152,45 @@ def main():
     print(f"  Mode:                {'Forward only' if args.forward_only else 'Forward + Backward'}")
     print()
     
-    print("Initializing Transformer model...")
-    model = TransformerLM(
-        vocab_size=args.vocab_size,
-        context_length=args.seq_len,
-        d_model=args.d_model,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        d_ff=d_ff,
-        device=device,
-        dtype=dtype
-    )
-    
-    print(f"Moving model to {device} with dtype {args.dtype}...")
-    model = model.to(device=device, dtype=dtype)
-    
-    model.train()
-    
-    # TESTING DEVICE PLACEMENT
-    """
-    print("Verifying device placement")
-    param_devices = set(p.device for p in model.parameters())
-    buffer_devices = set(b.device for b in model.buffers())
-    all_devices = param_devices | buffer_devices
-    
-    if len(all_devices) > 1:
-        print(f"ERROR: Model has tensors on multiple devices: {all_devices}")
-        print("Checking each component:")
-        for name, param in model.named_parameters():
-            if param.device != device:
-                print(f"  Parameter {name}: {param.device} (expected {device})")
-        for name, buffer in model.named_buffers():
-            if buffer.device != device:
-                print(f"  Buffer {name}: {buffer.device} (expected {device})")
-        raise RuntimeError("Model not fully on target device!")
-    else:
-        print(f"All model tensors on {device}")
-    """
+    with nvtx.range("model_initialization"):
+        print("Initializing Transformer model...")
+        model = TransformerLM(
+            vocab_size=args.vocab_size,
+            context_length=args.seq_len,
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+            d_ff=d_ff,
+            device=device,
+            dtype=dtype
+        )
+        model = model.to(device=device, dtype=dtype)
+        model.train()
     
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    if dtype == torch.float32:
-        dtype_size = 4
-    elif dtype in [torch.float16, torch.bfloat16]:
-        dtype_size = 2
-    else:
-        dtype_size = 4
-    
-    param_size_mb = total_params * dtype_size / (1024 ** 2)
-    
-    print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})")
-    print(f"Model size: {param_size_mb:.2f} MB ({args.dtype})")
+    print(f"Model parameters: {total_params:,}")
     print()
     
-    print("Generating random batch")
-    x, y = generate_random_batch(
-        args.batch_size,
-        args.seq_len,
-        args.vocab_size,
-        device
-    )
-    print(f"Input shape (x): {x.shape}")
-    print(f"Target shape (y): {y.shape}")
+    with nvtx.range("data_generation"):
+        print("Generating random batch")
+        x, y = generate_random_batch(args.batch_size, args.seq_len, args.vocab_size, device)
+        print(f"Input shape (x): {x.shape}")
+        print(f"Target shape (y): {y.shape}")
     print()
     
-    mean_time, std_time, times = run_benchmark(
-        model,
-        x,
-        y,
+    mean_time, std_time = run_benchmark(
+        model, x, y,
         warmup_steps=args.warmup_steps,
         iter_steps=args.iter_steps,
         forward_only=args.forward_only,
         device=device
     )
     
-    min_time = np.min(times)
-    max_time = np.max(times)
-    median_time = np.median(times)
-    
     print()
     print("="*80)
     print("RESULTS")
     print("="*80)
-    print("\nTiming Statistics:")
-    print(f"  Mean:   {mean_time*1000:.2f} ms")
-    print(f"  Std:    {std_time*1000:.2f} ms")
-    print(f"  Min:    {min_time*1000:.2f} ms")
-    print(f"  Max:    {max_time*1000:.2f} ms")
-    print(f"  Median: {median_time*1000:.2f} ms")
-    
-    if device.type == 'cuda':
-        print("\nGPU Memory:")
-        print(f"  Allocated: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
-        print(f"  Reserved:  {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
-        print(f"  Max allocated: {torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB")
-    
-    print("\nComputational Estimates:")
-    print(f"  Total parameters: {total_params:,}")
-    
-    # FLOP calculations
-    # Per layer (forward pass):
-    # - Attention: 2*B*T*d_model*d_model for QKV projections
-    #              + 2*B*T^2*d_model for attention computation
-    #              + 2*B*T*d_model*d_model for output projection
-    # - FFN: 2*B*T*d_model*d_ff for each of two linear layers (simplified for SwiGLU)
-    
-    B = args.batch_size
-    T = args.seq_len
-    d = args.d_model
-    
-    # Attention FLOPs per layer
-    qkv_proj_flops = 3 * 2 * B * T * d * d  # 3 projections (Q, K, V)
-    attn_scores_flops = 2 * B * args.num_heads * T * T * (d // args.num_heads)
-    attn_output_flops = 2 * B * args.num_heads * T * T * (d // args.num_heads)
-    out_proj_flops = 2 * B * T * d * d
-    attention_flops_per_layer = qkv_proj_flops + attn_scores_flops + attn_output_flops + out_proj_flops
-    
-    # FFN FLOPs per layer (simplified - actual SwiGLU has 3 matrices)
-    ffn_flops_per_layer = 2 * 2 * B * T * d * d_ff
-    
-    total_flops_per_layer = attention_flops_per_layer + ffn_flops_per_layer
-    total_flops = args.num_layers * total_flops_per_layer
-    
-    # Add embedding and final projection FLOPs
-    final_proj_flops = 2 * B * T * d * args.vocab_size
-    total_flops += final_proj_flops
-    
-    tflops = total_flops / 1e12
-    tflops_per_sec = tflops / mean_time
-    
-    print(f"  Estimated FLOPs (forward): {tflops:.3f} TFLOPs")
-    print(f"  Estimated throughput: {tflops_per_sec:.3f} TFLOPs/sec")
-    print("\n" + "="*80)
-    
-    print("\nSUMMARY FOR ASSIGNMENT:")
-    print(f"Configuration: L={args.num_layers}, d_model={args.d_model}, H={args.num_heads}, "
-          f"B={args.batch_size}, T={args.seq_len}")
-    print(f"Mode: {'Forward only' if args.forward_only else 'Forward + Backward'}")
-    print(f"Warm-up steps: {args.warmup_steps}")
-    print(f"Average time: {mean_time*1000:.2f} ms ± {std_time*1000:.2f} ms")
+    print(f"\nMean: {mean_time*1000:.2f} ms ± {std_time*1000:.2f} ms")
     print(f"Throughput: {args.batch_size * args.seq_len / mean_time:,.0f} tokens/sec")
     print("="*80)
 
